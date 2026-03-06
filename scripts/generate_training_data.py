@@ -3,8 +3,18 @@ BGE-M3 Hard Negative 개선을 위한 학습 데이터 생성 스크립트.
 
 GPT API를 사용하여 다양한 미디어 장르의 장면 메타데이터와
 normal / hard_negative / negative 질의를 생성합니다.
+
+사용법:
+    # Batch API (50% 비용 절감, 24시간 내 완료)
+    python scripts/generate_training_data.py --mode batch submit
+    python scripts/generate_training_data.py --mode batch status --batch-id <batch_id>
+    python scripts/generate_training_data.py --mode batch download --batch-id <batch_id>
+
+    # 실시간 API (즉시 결과, 정가)
+    python scripts/generate_training_data.py --mode realtime
 """
 
+import argparse
 import json
 import os
 import random
@@ -176,8 +186,42 @@ def build_generation_prompt(genre: str, template: dict, batch_size: int) -> str:
 """
 
 
+def parse_gpt_response(content: str | None) -> list:
+    """GPT 응답 content를 파싱하여 장면 리스트로 반환합니다."""
+    if not content:
+        return []
+
+    content = content.strip()
+
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        # Try to extract JSON array from response
+        try:
+            start = content.index("[")
+            end = content.rindex("]") + 1
+            parsed = json.loads(content[start:end])
+        except (ValueError, json.JSONDecodeError):
+            return []
+
+    # Handle both {"data": [...]} and [...] formats
+    if isinstance(parsed, dict):
+        for key in ("data", "scenes", "items", "results"):
+            if key in parsed and isinstance(parsed[key], list):
+                return parsed[key]
+        if "metadata" in parsed and "query" in parsed:
+            return [parsed]
+        values = list(parsed.values())
+        if values and isinstance(values[0], list):
+            return values[0]
+        return []
+    if isinstance(parsed, list):
+        return parsed
+    return []
+
+
 def call_gpt_api(client: OpenAI, prompt: str, model: str, max_retries: int = 3, retry_delay: float = 2.0) -> list:
-    """GPT API를 호출하여 학습 데이터를 생성합니다."""
+    """GPT API를 실시간 호출하여 학습 데이터를 생성합니다."""
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
@@ -190,30 +234,12 @@ def call_gpt_api(client: OpenAI, prompt: str, model: str, max_retries: int = 3, 
                 max_tokens=4096,
                 response_format={"type": "json_object"},
             )
-            content = response.choices[0].message.content.strip()
-            parsed = json.loads(content)
+            content = response.choices[0].message.content
+            scenes = parse_gpt_response(content)
+            if scenes:
+                return scenes
+            print(f"  API call attempt {attempt + 1}/{max_retries}: empty response")
 
-            # Handle both {"data": [...]} and [...] formats
-            if isinstance(parsed, dict):
-                for key in ("data", "scenes", "items", "results"):
-                    if key in parsed and isinstance(parsed[key], list):
-                        return parsed[key]
-                # If dict has numeric keys or is a single scene
-                if "metadata" in parsed and "query" in parsed:
-                    return [parsed]
-                return list(parsed.values())[0] if parsed else []
-            if isinstance(parsed, list):
-                return parsed
-            return []
-
-        except json.JSONDecodeError:
-            # Try to extract JSON array from response
-            try:
-                start = content.index("[")
-                end = content.rindex("]") + 1
-                return json.loads(content[start:end])
-            except (ValueError, json.JSONDecodeError):
-                pass
         except Exception as e:
             print(f"  API call attempt {attempt + 1}/{max_retries} failed: {e}")
 
@@ -275,8 +301,246 @@ def split_dataset(data: list, config: dict) -> dict:
     }
 
 
-def main():
-    config = load_config()
+def save_scenes(all_scenes: list, config: dict):
+    """생성된 장면들을 파일로 저장합니다 (개별 파일 + 합본 + 분할)."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Save each scene as an individual file by genre
+    scenes_by_genre = {}
+    for scene in all_scenes:
+        genre = scene.get("genre", "unknown")
+        scenes_by_genre.setdefault(genre, []).append(scene)
+
+    for genre, scenes in scenes_by_genre.items():
+        genre_dir = OUTPUT_DIR / "scenes" / genre
+        genre_dir.mkdir(parents=True, exist_ok=True)
+        for scene_idx, scene in enumerate(scenes):
+            scene_path = genre_dir / f"scene_{scene_idx:04d}.json"
+            with open(scene_path, "w", encoding="utf-8") as f:
+                json.dump(scene, f, ensure_ascii=False, indent=2)
+
+    # Save complete raw dataset
+    raw_path = OUTPUT_DIR / "raw_all.json"
+    with open(raw_path, "w", encoding="utf-8") as f:
+        json.dump(all_scenes, f, ensure_ascii=False, indent=2)
+    print(f"\nTotal valid scenes: {len(all_scenes)} => {raw_path}")
+
+    # Split into train/val/test
+    splits = split_dataset(all_scenes, config)
+    for split_name, split_data in splits.items():
+        # Save combined split file
+        split_path = OUTPUT_DIR / f"{split_name}.json"
+        with open(split_path, "w", encoding="utf-8") as f:
+            json.dump(split_data, f, ensure_ascii=False, indent=2)
+
+        # Save each scene as an individual file under split directory
+        split_dir = OUTPUT_DIR / "scenes" / split_name
+        split_dir.mkdir(parents=True, exist_ok=True)
+        for scene_idx, scene in enumerate(split_data):
+            scene_path = split_dir / f"scene_{scene_idx:04d}.json"
+            with open(scene_path, "w", encoding="utf-8") as f:
+                json.dump(scene, f, ensure_ascii=False, indent=2)
+
+        print(f"  {split_name}: {len(split_data)} samples => {split_path} + {split_dir}/")
+
+    # Generate training triplets
+    generate_triplets(splits["train"], OUTPUT_DIR / "train_triplets.json")
+    generate_triplets(splits["val"], OUTPUT_DIR / "val_triplets.json")
+
+    print("\nData generation complete!")
+
+
+# ===========================================================================
+# Batch API
+# ===========================================================================
+
+def build_batch_requests(config: dict) -> list[dict]:
+    """Batch API용 요청 목록을 생성합니다."""
+    gen_config = config["data_generation"]
+    model = os.getenv("OPENAI_MODEL", "gpt-4o")
+    total_target = gen_config["total_samples"]
+    batch_size = gen_config["api_batch_size"]
+    genres = gen_config["genres"]
+
+    samples_per_genre = total_target // len(genres)
+    batches_per_genre = max(1, samples_per_genre // batch_size)
+
+    requests = []
+    for genre in genres:
+        template = GENRE_TEMPLATES[genre]
+        for batch_idx in range(batches_per_genre):
+            prompt = build_generation_prompt(genre, template, batch_size)
+            custom_id = f"{genre}_{batch_idx:04d}"
+
+            request = {
+                "custom_id": custom_id,
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": "You are a media content metadata and search query dataset generator. Always respond with valid JSON arrays only."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.9,
+                    "max_tokens": 4096,
+                    "response_format": {"type": "json_object"},
+                },
+            }
+            requests.append(request)
+
+    return requests
+
+
+def batch_submit(config: dict):
+    """Batch API 요청을 제출합니다."""
+    api_key = os.getenv("OPEN_AI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key or api_key == "your_openai_api_key_here":
+        print("Error: OPEN_AI_API_KEY not set. Please set it in .env file.")
+        return
+
+    client = OpenAI(api_key=api_key)
+
+    # Build all requests
+    requests = build_batch_requests(config)
+    print(f"Total batch requests: {len(requests)}")
+
+    # Write JSONL file
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    jsonl_path = OUTPUT_DIR / "batch_requests.jsonl"
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        for req in requests:
+            f.write(json.dumps(req, ensure_ascii=False) + "\n")
+    print(f"JSONL file saved: {jsonl_path}")
+
+    # Upload file
+    with open(jsonl_path, "rb") as f:
+        uploaded = client.files.create(file=f, purpose="batch")
+    print(f"File uploaded: {uploaded.id}")
+
+    # Create batch
+    batch = client.batches.create(
+        input_file_id=uploaded.id,
+        endpoint="/v1/chat/completions",
+        completion_window="24h",
+        metadata={"description": "media_embedding training data generation"},
+    )
+    print(f"\nBatch created!")
+    print(f"  Batch ID: {batch.id}")
+    print(f"  Status:   {batch.status}")
+    print(f"\nCheck status with:")
+    print(f"  python scripts/generate_training_data.py --mode batch status --batch-id {batch.id}")
+    print(f"\nDownload results with:")
+    print(f"  python scripts/generate_training_data.py --mode batch download --batch-id {batch.id}")
+
+    # Save batch ID for convenience
+    batch_info_path = OUTPUT_DIR / "batch_info.json"
+    with open(batch_info_path, "w", encoding="utf-8") as f:
+        json.dump({"batch_id": batch.id, "file_id": uploaded.id, "num_requests": len(requests)}, f, indent=2)
+    print(f"\nBatch info saved: {batch_info_path}")
+
+
+def batch_status(batch_id: str):
+    """Batch 상태를 확인합니다."""
+    api_key = os.getenv("OPEN_AI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    client = OpenAI(api_key=api_key)
+
+    batch = client.batches.retrieve(batch_id)
+
+    print(f"Batch ID:    {batch.id}")
+    print(f"Status:      {batch.status}")
+    print(f"Created at:  {batch.created_at}")
+    if batch.request_counts:
+        print(f"Total:       {batch.request_counts.total}")
+        print(f"Completed:   {batch.request_counts.completed}")
+        print(f"Failed:      {batch.request_counts.failed}")
+
+    if batch.status == "completed":
+        print(f"\nOutput file: {batch.output_file_id}")
+        if batch.error_file_id:
+            print(f"Error file:  {batch.error_file_id}")
+        print(f"\nDownload with:")
+        print(f"  python scripts/generate_training_data.py --mode batch download --batch-id {batch.id}")
+    elif batch.status == "failed":
+        print(f"\nBatch failed.")
+        if batch.errors and batch.errors.data:
+            for err in batch.errors.data:
+                print(f"  Error: {err.code} - {err.message}")
+
+
+def batch_download(batch_id: str, config: dict):
+    """Batch 결과를 다운로드하고 처리합니다."""
+    api_key = os.getenv("OPEN_AI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    client = OpenAI(api_key=api_key)
+
+    batch = client.batches.retrieve(batch_id)
+
+    if batch.status != "completed":
+        print(f"Batch is not completed yet. Status: {batch.status}")
+        return
+
+    # Download output file
+    output_content = client.files.content(batch.output_file_id)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = OUTPUT_DIR / "batch_output.jsonl"
+    with open(output_path, "wb") as f:
+        f.write(output_content.content)
+    print(f"Output downloaded: {output_path}")
+
+    # Download error file if exists
+    if batch.error_file_id:
+        error_content = client.files.content(batch.error_file_id)
+        error_path = OUTPUT_DIR / "batch_errors.jsonl"
+        with open(error_path, "wb") as f:
+            f.write(error_content.content)
+        print(f"Errors downloaded: {error_path}")
+
+    # Parse results
+    all_scenes = []
+    success_count = 0
+    fail_count = 0
+
+    with open(output_path, "r", encoding="utf-8") as f:
+        for line in f:
+            result = json.loads(line)
+            custom_id = result["custom_id"]
+            genre = custom_id.rsplit("_", 1)[0]
+
+            response_body = result.get("response", {}).get("body", {})
+            choices = response_body.get("choices", [])
+
+            if not choices:
+                fail_count += 1
+                continue
+
+            content = choices[0].get("message", {}).get("content")
+            scenes = parse_gpt_response(content)
+
+            valid_scenes = []
+            for scene in scenes:
+                if validate_scene(scene):
+                    scene["genre"] = genre
+                    valid_scenes.append(scene)
+
+            if valid_scenes:
+                success_count += 1
+                all_scenes.extend(valid_scenes)
+            else:
+                fail_count += 1
+
+    print(f"\nParsed results: {success_count} successful, {fail_count} failed")
+    print(f"Total valid scenes: {len(all_scenes)}")
+
+    # Save scenes
+    save_scenes(all_scenes, config)
+
+
+# ===========================================================================
+# Realtime API (기존 방식)
+# ===========================================================================
+
+def realtime_generate(config: dict):
+    """실시간 API로 학습 데이터를 생성합니다."""
     gen_config = config["data_generation"]
 
     api_key = os.getenv("OPEN_AI_API_KEY") or os.getenv("OPENAI_API_KEY")
@@ -293,7 +557,6 @@ def main():
     batch_size = gen_config["api_batch_size"]
     genres = gen_config["genres"]
 
-    # Distribute samples across genres evenly
     samples_per_genre = total_target // len(genres)
     batches_per_genre = max(1, samples_per_genre // batch_size)
 
@@ -330,58 +593,20 @@ def main():
         print(f"  => {len(genre_scenes)} valid scenes generated")
         all_scenes.extend(genre_scenes)
 
-        # Save each scene as an individual file
-        genre_dir = OUTPUT_DIR / "scenes" / genre
-        genre_dir.mkdir(parents=True, exist_ok=True)
-        for scene_idx, scene in enumerate(genre_scenes):
-            scene_path = genre_dir / f"scene_{scene_idx:04d}.json"
-            with open(scene_path, "w", encoding="utf-8") as f:
-                json.dump(scene, f, ensure_ascii=False, indent=2)
+    save_scenes(all_scenes, config)
 
-    print(f"\nTotal valid scenes: {len(all_scenes)}")
 
-    # Save complete raw dataset
-    raw_path = OUTPUT_DIR / "raw_all.json"
-    with open(raw_path, "w", encoding="utf-8") as f:
-        json.dump(all_scenes, f, ensure_ascii=False, indent=2)
-
-    # Split into train/val/test
-    splits = split_dataset(all_scenes, config)
-    for split_name, split_data in splits.items():
-        # Save combined split file
-        split_path = OUTPUT_DIR / f"{split_name}.json"
-        with open(split_path, "w", encoding="utf-8") as f:
-            json.dump(split_data, f, ensure_ascii=False, indent=2)
-
-        # Save each scene as an individual file under split directory
-        split_dir = OUTPUT_DIR / "scenes" / split_name
-        split_dir.mkdir(parents=True, exist_ok=True)
-        for scene_idx, scene in enumerate(split_data):
-            scene_path = split_dir / f"scene_{scene_idx:04d}.json"
-            with open(scene_path, "w", encoding="utf-8") as f:
-                json.dump(scene, f, ensure_ascii=False, indent=2)
-
-        print(f"  {split_name}: {len(split_data)} samples => {split_path} + {split_dir}/")
-
-    # Generate training triplets file (for direct training consumption)
-    generate_triplets(splits["train"], OUTPUT_DIR / "train_triplets.json")
-    generate_triplets(splits["val"], OUTPUT_DIR / "val_triplets.json")
-
-    print("\nData generation complete!")
-
+# ===========================================================================
+# Triplet generation & utilities
+# ===========================================================================
 
 def generate_triplets(scenes: list, output_path: Path):
-    """
-    학습용 triplet 데이터를 생성합니다.
-    각 triplet: (query, positive_passage, hard_negative_passage, negative_passage)
-    """
+    """학습용 triplet 데이터를 생성합니다."""
     triplets = []
 
     for scene in scenes:
         metadata = scene["metadata"]
         query_data = scene["query"]
-
-        # Flatten metadata into a passage string
         passage = metadata_to_passage(metadata)
 
         for normal_q in query_data["normal"]:
@@ -419,6 +644,53 @@ def metadata_to_passage(metadata: dict) -> str:
         parts.append(f"행동: {' '.join(actions)}")
 
     return " | ".join(parts)
+
+
+# ===========================================================================
+# CLI
+# ===========================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="학습 데이터 생성 (Batch API / Realtime API)")
+    parser.add_argument("--mode", choices=["batch", "realtime"], default="batch",
+                        help="API 호출 방식 (default: batch)")
+    parser.add_argument("action", nargs="?", default="submit",
+                        help="batch 모드: submit / status / download (default: submit)")
+    parser.add_argument("--batch-id", type=str, default=None,
+                        help="Batch ID (status/download에 필요)")
+    args = parser.parse_args()
+
+    config = load_config()
+
+    if args.mode == "realtime":
+        realtime_generate(config)
+    elif args.mode == "batch":
+        if args.action == "submit":
+            batch_submit(config)
+        elif args.action == "status":
+            bid = args.batch_id or _load_batch_id()
+            if not bid:
+                print("Error: --batch-id required. Or run 'submit' first.")
+                return
+            batch_status(bid)
+        elif args.action == "download":
+            bid = args.batch_id or _load_batch_id()
+            if not bid:
+                print("Error: --batch-id required. Or run 'submit' first.")
+                return
+            batch_download(bid, config)
+        else:
+            parser.print_help()
+
+
+def _load_batch_id() -> str | None:
+    """저장된 batch_info.json에서 batch_id를 로드합니다."""
+    batch_info_path = OUTPUT_DIR / "batch_info.json"
+    if batch_info_path.exists():
+        with open(batch_info_path, "r") as f:
+            info = json.load(f)
+        return info.get("batch_id")
+    return None
 
 
 if __name__ == "__main__":
