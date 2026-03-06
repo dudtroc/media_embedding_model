@@ -24,8 +24,16 @@ class SceneTripletDataset(Dataset):
     """
 
     def __init__(self, data_path: str | Path, tokenizer, max_length: int = 512, num_hard_neg: int = 2, num_neg: int = 1):
-        with open(data_path, "r", encoding="utf-8") as f:
-            self.raw_data = json.load(f)
+        data_path = Path(data_path)
+        if data_path.is_dir():
+            # Load individual scene files from directory
+            self.raw_data = []
+            for scene_file in sorted(data_path.glob("scene_*.json")):
+                with open(scene_file, "r", encoding="utf-8") as f:
+                    self.raw_data.append(json.load(f))
+        else:
+            with open(data_path, "r", encoding="utf-8") as f:
+                self.raw_data = json.load(f)
 
         self.tokenizer = tokenizer
         self.max_length = max_length

@@ -330,10 +330,13 @@ def main():
         print(f"  => {len(genre_scenes)} valid scenes generated")
         all_scenes.extend(genre_scenes)
 
-        # Save intermediate results per genre
-        genre_path = OUTPUT_DIR / f"raw_{genre}.json"
-        with open(genre_path, "w", encoding="utf-8") as f:
-            json.dump(genre_scenes, f, ensure_ascii=False, indent=2)
+        # Save each scene as an individual file
+        genre_dir = OUTPUT_DIR / "scenes" / genre
+        genre_dir.mkdir(parents=True, exist_ok=True)
+        for scene_idx, scene in enumerate(genre_scenes):
+            scene_path = genre_dir / f"scene_{scene_idx:04d}.json"
+            with open(scene_path, "w", encoding="utf-8") as f:
+                json.dump(scene, f, ensure_ascii=False, indent=2)
 
     print(f"\nTotal valid scenes: {len(all_scenes)}")
 
@@ -345,10 +348,20 @@ def main():
     # Split into train/val/test
     splits = split_dataset(all_scenes, config)
     for split_name, split_data in splits.items():
+        # Save combined split file
         split_path = OUTPUT_DIR / f"{split_name}.json"
         with open(split_path, "w", encoding="utf-8") as f:
             json.dump(split_data, f, ensure_ascii=False, indent=2)
-        print(f"  {split_name}: {len(split_data)} samples => {split_path}")
+
+        # Save each scene as an individual file under split directory
+        split_dir = OUTPUT_DIR / "scenes" / split_name
+        split_dir.mkdir(parents=True, exist_ok=True)
+        for scene_idx, scene in enumerate(split_data):
+            scene_path = split_dir / f"scene_{scene_idx:04d}.json"
+            with open(scene_path, "w", encoding="utf-8") as f:
+                json.dump(scene, f, ensure_ascii=False, indent=2)
+
+        print(f"  {split_name}: {len(split_data)} samples => {split_path} + {split_dir}/")
 
     # Generate training triplets file (for direct training consumption)
     generate_triplets(splits["train"], OUTPUT_DIR / "train_triplets.json")
