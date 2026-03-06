@@ -259,7 +259,7 @@ def validate_scene(scene: dict) -> bool:
     metadata = scene.get("metadata")
     query = scene.get("query")
 
-    if not metadata or not query:
+    if not isinstance(metadata, dict) or not isinstance(query, dict):
         return False
 
     required_meta_keys = {"Place", "Approximate Time", "Atmosphere", "Keywords", "Main Characters", "caption", "Action"}
