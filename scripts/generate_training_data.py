@@ -635,7 +635,10 @@ def metadata_to_passage(metadata: dict) -> str:
 
     characters = metadata.get("Main Characters", [])
     for char in characters:
-        parts.append(f"등장인물: {char.get('name', '')} ({char.get('type', '')}) - {char.get('description', '')}")
+        if isinstance(char, dict):
+            parts.append(f"등장인물: {char.get('name', '')} ({char.get('type', '')}) - {char.get('description', '')}")
+        else:
+            parts.append(f"등장인물: {char}")
 
     parts.append(f"요약: {metadata.get('caption', '')}")
 
