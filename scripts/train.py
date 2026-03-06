@@ -265,7 +265,7 @@ def main():
     model_name = train_config["base_model"]
     print(f"Loading model: {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name, use_safetensors=True)
     model.to(device)
 
     # Load datasets

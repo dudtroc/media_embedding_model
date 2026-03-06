@@ -178,7 +178,7 @@ def main():
         print("Original BGE-M3")
         print("=" * 60)
         orig_tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-m3")
-        orig_model = AutoModel.from_pretrained("BAAI/bge-m3").to(device)
+        orig_model = AutoModel.from_pretrained("BAAI/bge-m3", use_safetensors=True).to(device)
         orig_metrics = evaluate_model(orig_model, orig_tokenizer, test_data, device)
         del orig_model
         torch.cuda.empty_cache() if device.type == "cuda" else None
@@ -188,7 +188,7 @@ def main():
         print(f"Fine-tuned BGE-M3: {ft_path}")
         print("=" * 60)
         ft_tokenizer = AutoTokenizer.from_pretrained(ft_path)
-        ft_model = AutoModel.from_pretrained(ft_path).to(device)
+        ft_model = AutoModel.from_pretrained(ft_path, use_safetensors=True).to(device)
         ft_metrics = evaluate_model(ft_model, ft_tokenizer, test_data, device)
 
         # Print comparison
@@ -216,7 +216,7 @@ def main():
         model_path = args.model_path or str(PROJECT_DIR / "models" / "bge-m3-finetuned" / "best")
         print(f"\nEvaluating model: {model_path}")
         tokenizer = AutoTokenizer.from_pretrained(model_path)
-        model = AutoModel.from_pretrained(model_path).to(device)
+        model = AutoModel.from_pretrained(model_path, use_safetensors=True).to(device)
 
         metrics = evaluate_model(model, tokenizer, test_data, device)
 
