@@ -66,7 +66,10 @@ class SceneTripletDataset(Dataset):
             f"키워드: {', '.join(metadata.get('Keywords', []))}",
         ]
         for char in metadata.get("Main Characters", []):
-            parts.append(f"등장인물: {char.get('name', '')} ({char.get('type', '')}) - {char.get('description', '')}")
+            if isinstance(char, dict):
+                parts.append(f"등장인물: {char.get('name', '')} ({char.get('type', '')}) - {char.get('description', '')}")
+            else:
+                parts.append(f"등장인물: {char}")
         parts.append(f"요약: {metadata.get('caption', '')}")
         actions = metadata.get("Action", [])
         if actions:
