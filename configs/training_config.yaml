@@ -1,0 +1,79 @@
+# BGE-M3 Fine-tuning Configuration for Hard Negative Improvement
+
+# Data Generation Settings
+data_generation:
+  # Total number of training samples to generate
+  # Hard Negative 개선을 위해 최소 20,000개 이상의 학습 데이터 필요
+  # - 15,000개: 학습용 (train)
+  # - 3,000개: 검증용 (validation)
+  # - 2,000개: 평가용 (test)
+  total_samples: 20000
+  train_ratio: 0.75
+  val_ratio: 0.15
+  test_ratio: 0.10
+
+  # Number of queries per scene metadata
+  queries_per_scene:
+    normal: 3          # 정답 질의 (Positive)
+    hard_negative: 3   # 유사하지만 다른 장면을 가리키는 질의 (Hard Negative)
+    negative: 2        # 명확히 다른 질의 (Easy Negative)
+
+  # Batch size for GPT API calls
+  api_batch_size: 5
+  api_max_retries: 3
+  api_retry_delay: 2
+
+  # Media genres for diverse data generation
+  genres:
+    - drama          # 드라마
+    - movie          # 영화
+    - documentary    # 다큐멘터리
+    - news           # 뉴스
+    - variety_show   # 예능
+    - animation      # 애니메이션
+    - music_video    # 뮤직비디오
+    - advertisement  # 광고
+    - sports         # 스포츠
+    - education      # 교육/강의
+
+# Model Training Settings
+training:
+  base_model: "BAAI/bge-m3"
+  output_dir: "./models/bge-m3-finetuned"
+
+  # Training hyperparameters
+  epochs: 5
+  batch_size: 16
+  learning_rate: 1.0e-5
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  max_seq_length: 512
+  fp16: true
+  gradient_accumulation_steps: 2
+
+  # Hard Negative Loss Settings
+  loss:
+    # TripletMarginLoss + InfoNCE combination
+    type: "hard_negative_contrastive"
+    temperature: 0.05
+    margin: 0.3
+    hard_negative_weight: 3.0    # Hard negative에 더 높은 가중치
+    negative_weight: 1.0
+
+  # In-batch negatives
+  use_in_batch_negatives: true
+
+  # Evaluation
+  eval_steps: 500
+  save_steps: 500
+  logging_steps: 100
+
+# Evaluation Settings
+evaluation:
+  metrics:
+    - "recall@1"
+    - "recall@5"
+    - "recall@10"
+    - "mrr"
+    - "ndcg@10"
+    - "hard_negative_discrimination_rate"
