@@ -1,0 +1,11 @@
+# 환경 변수 (API 키 등 비밀 정보)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
