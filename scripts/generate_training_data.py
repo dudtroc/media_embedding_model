@@ -9,8 +9,23 @@ normal / hard_negative / negative 질의를 생성합니다.
 - Confusable Scene (혼동 유발 장면) 기반 Hard Negative passage 생성
 - Entity-Attribute Swap 기반 Hard Negative 질의 생성
 - 증분 생성 지원 (기존 데이터 위에 추가 생성)
+- OpenAI Batch API 지원 (50% 비용 절감)
+
+사용법:
+    # 실시간 생성 (기존 방식)
+    python scripts/generate_training_data.py
+
+    # Batch API: 요청 파일 생성 + 제출
+    python scripts/generate_training_data.py --mode batch
+
+    # Batch 상태 확인
+    python scripts/generate_training_data.py --mode batch-status --batch-id batch_xxxxx
+
+    # Batch 결과 다운로드 및 처리
+    python scripts/generate_training_data.py --mode batch-download --batch-id batch_xxxxx
 """
 
+import argparse
 import json
 import os
 import random
@@ -28,6 +43,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = SCRIPT_DIR.parent
 CONFIG_PATH = PROJECT_DIR / "configs" / "training_config.yaml"
 OUTPUT_DIR = PROJECT_DIR / "data"
+BATCH_DIR = OUTPUT_DIR / "batch"
 
 
 def load_config() -> dict:
@@ -381,66 +397,303 @@ def split_dataset(data: list, config: dict) -> dict:
     }
 
 
-def main():
-    config = load_config()
-    gen_config = config["data_generation"]
+def _parse_gpt_response(content: str) -> list:
+    """GPT 응답을 파싱하여 장면 리스트를 반환합니다."""
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        try:
+            start = content.index("[")
+            end = content.rindex("]") + 1
+            return json.loads(content[start:end])
+        except (ValueError, json.JSONDecodeError):
+            return []
 
+    if isinstance(parsed, dict):
+        for key in ("data", "scenes", "items", "results"):
+            if key in parsed and isinstance(parsed[key], list):
+                return parsed[key]
+        if "metadata" in parsed and "query" in parsed:
+            return [parsed]
+        values = list(parsed.values())
+        return values[0] if values and isinstance(values[0], list) else []
+    if isinstance(parsed, list):
+        return parsed
+    return []
+
+
+def _get_client() -> OpenAI:
+    """OpenAI 클라이언트를 생성합니다."""
     api_key = os.getenv("OPEN_AI_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not api_key or api_key == "your_openai_api_key_here":
-        print("Error: OPEN_AI_API_KEY not set. Please set it in .env file.")
+        raise ValueError("OPEN_AI_API_KEY not set. Please set it in .env file.")
+    return OpenAI(api_key=api_key)
+
+
+def _save_and_split(all_scenes: list, config: dict):
+    """전체 데이터를 저장하고 train/val/test로 분할합니다."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Save raw_all.json
+    raw_path = OUTPUT_DIR / "raw_all.json"
+    with open(raw_path, "w", encoding="utf-8") as f:
+        json.dump(all_scenes, f, ensure_ascii=False, indent=2)
+    print(f"  전체 데이터: {len(all_scenes)}개 => {raw_path}")
+
+    # Save per-genre files
+    genre_groups = {}
+    for scene in all_scenes:
+        g = scene.get("genre", "unknown")
+        genre_groups.setdefault(g, []).append(scene)
+    for g, scenes_list in genre_groups.items():
+        genre_path = OUTPUT_DIR / f"raw_{g}.json"
+        with open(genre_path, "w", encoding="utf-8") as f:
+            json.dump(scenes_list, f, ensure_ascii=False, indent=2)
+
+    # Split
+    splits = split_dataset(all_scenes, config)
+    for split_name, split_data in splits.items():
+        split_path = OUTPUT_DIR / f"{split_name}.json"
+        with open(split_path, "w", encoding="utf-8") as f:
+            json.dump(split_data, f, ensure_ascii=False, indent=2)
+        print(f"  {split_name}: {len(split_data)} samples => {split_path}")
+
+    generate_triplets(splits["train"], OUTPUT_DIR / "train_triplets.json")
+    generate_triplets(splits["val"], OUTPUT_DIR / "val_triplets.json")
+
+
+def _calc_genre_needs(config: dict) -> dict[str, int]:
+    """장르별 추가 생성 필요량을 계산합니다."""
+    gen_config = config["data_generation"]
+    total_target = gen_config["total_samples"]
+    genres = gen_config["genres"]
+
+    _, genre_counts = load_existing_data()
+    target_per_genre = total_target // len(genres)
+
+    needs = {}
+    for genre in genres:
+        existing = genre_counts.get(genre, 0)
+        needed = target_per_genre - existing
+        if needed > 0:
+            needs[genre] = needed
+        else:
+            print(f"[{genre}] 이미 {existing}개 존재 (목표: {target_per_genre}). 건너뜀.")
+    return needs
+
+
+# ---------------------------------------------------------------------------
+# OpenAI Batch API
+# ---------------------------------------------------------------------------
+
+def create_batch_requests(config: dict) -> Path | None:
+    """Batch API용 JSONL 요청 파일을 생성합니다."""
+    gen_config = config["data_generation"]
+    batch_size = gen_config["api_batch_size"]
+    model = os.getenv("OPENAI_MODEL", "gpt-4o")
+
+    genre_needs = _calc_genre_needs(config)
+    if not genre_needs:
+        print("추가 생성이 필요하지 않습니다.")
+        return None
+
+    BATCH_DIR.mkdir(parents=True, exist_ok=True)
+    jsonl_path = BATCH_DIR / "batch_requests.jsonl"
+
+    request_count = 0
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        for genre, needed in genre_needs.items():
+            template = GENRE_TEMPLATES[genre]
+            num_batches = max(1, needed // batch_size)
+            print(f"[{genre}] {num_batches}개 배치 요청 생성 (필요: {needed}개)")
+
+            for batch_idx in range(num_batches):
+                prompt = build_generation_prompt(genre, template, batch_size)
+                request = {
+                    "custom_id": f"{genre}_{batch_idx:05d}",
+                    "method": "POST",
+                    "url": "/v1/chat/completions",
+                    "body": {
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": "You are a media content metadata and search query dataset generator. Always respond with valid JSON arrays only."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": 0.9,
+                        "max_tokens": 8192,
+                        "response_format": {"type": "json_object"},
+                    },
+                }
+                f.write(json.dumps(request, ensure_ascii=False) + "\n")
+                request_count += 1
+
+    print(f"\n총 {request_count}개 배치 요청 생성 => {jsonl_path}")
+    return jsonl_path
+
+
+def submit_batch(client: OpenAI, jsonl_path: Path) -> str:
+    """Batch 요청 파일을 업로드하고 배치 작업을 제출합니다."""
+    print(f"파일 업로드 중: {jsonl_path}")
+    with open(jsonl_path, "rb") as f:
+        uploaded = client.files.create(file=f, purpose="batch")
+    print(f"  파일 ID: {uploaded.id}")
+
+    print("배치 작업 제출 중...")
+    batch = client.batches.create(
+        input_file_id=uploaded.id,
+        endpoint="/v1/chat/completions",
+        completion_window="24h",
+        metadata={"description": "media_embedding_training_data"},
+    )
+    print(f"  배치 ID: {batch.id}")
+    print(f"  상태: {batch.status}")
+
+    # Save batch info
+    batch_info = {"batch_id": batch.id, "input_file_id": uploaded.id, "status": batch.status}
+    info_path = BATCH_DIR / f"batch_info_{batch.id}.json"
+    with open(info_path, "w", encoding="utf-8") as f:
+        json.dump(batch_info, f, indent=2)
+
+    print(f"\n배치가 제출되었습니다!")
+    print(f"상태 확인:   python scripts/generate_training_data.py --mode batch-status --batch-id {batch.id}")
+    print(f"결과 다운로드: python scripts/generate_training_data.py --mode batch-download --batch-id {batch.id}")
+    return batch.id
+
+
+def check_batch_status(client: OpenAI, batch_id: str):
+    """배치 작업의 상태를 확인합니다."""
+    batch = client.batches.retrieve(batch_id)
+    print(f"배치 ID: {batch.id}")
+    print(f"상태: {batch.status}")
+    print(f"총 요청: {batch.request_counts.total}")
+    print(f"완료: {batch.request_counts.completed}")
+    print(f"실패: {batch.request_counts.failed}")
+
+    if batch.output_file_id:
+        print(f"결과 파일 ID: {batch.output_file_id}")
+    if batch.error_file_id:
+        print(f"에러 파일 ID: {batch.error_file_id}")
+
+    if batch.status == "completed":
+        print(f"\n배치 완료! 결과를 다운로드하세요:")
+        print(f"  python scripts/generate_training_data.py --mode batch-download --batch-id {batch_id}")
+    elif batch.status in ("validating", "in_progress", "finalizing"):
+        progress = batch.request_counts.completed / max(batch.request_counts.total, 1) * 100
+        print(f"\n진행률: {progress:.1f}%")
+    elif batch.status == "failed":
+        print("\n배치 실패.")
+        if batch.errors:
+            for error in batch.errors.data:
+                print(f"  에러: {error.code} - {error.message}")
+
+
+def download_batch_results(client: OpenAI, batch_id: str, config: dict):
+    """배치 결과를 다운로드하고 학습 데이터로 처리합니다."""
+    batch = client.batches.retrieve(batch_id)
+    if batch.status != "completed":
+        print(f"배치가 아직 완료되지 않았습니다 (상태: {batch.status})")
         return
 
+    if not batch.output_file_id:
+        print("결과 파일이 없습니다.")
+        return
+
+    # Download results
+    print(f"결과 다운로드 중 (파일 ID: {batch.output_file_id})...")
+    result_content = client.files.content(batch.output_file_id)
+    BATCH_DIR.mkdir(parents=True, exist_ok=True)
+    result_path = BATCH_DIR / f"batch_results_{batch_id}.jsonl"
+    with open(result_path, "wb") as f:
+        f.write(result_content.read())
+    print(f"  저장: {result_path}")
+
+    # Download errors if any
+    if batch.error_file_id:
+        error_content = client.files.content(batch.error_file_id)
+        error_path = BATCH_DIR / f"batch_errors_{batch_id}.jsonl"
+        with open(error_path, "wb") as f:
+            f.write(error_content.read())
+        print(f"  에러 파일: {error_path}")
+
+    # Parse results
+    print("\n결과 파싱 중...")
+    new_scenes = []
+    failed_count = 0
+
+    with open(result_path, "r", encoding="utf-8") as f:
+        for line in f:
+            result = json.loads(line.strip())
+            custom_id = result.get("custom_id", "")
+            genre = custom_id.rsplit("_", 1)[0] if "_" in custom_id else "unknown"
+
+            if result.get("error"):
+                failed_count += 1
+                continue
+
+            response_body = result.get("response", {}).get("body", {})
+            choices = response_body.get("choices", [])
+            if not choices:
+                failed_count += 1
+                continue
+
+            content = choices[0].get("message", {}).get("content", "")
+            if not content:
+                failed_count += 1
+                continue
+
+            scenes = _parse_gpt_response(content)
+            for scene in scenes:
+                if validate_scene(scene):
+                    scene["genre"] = genre
+                    new_scenes.append(scene)
+
+    print(f"  새로 생성된 장면: {len(new_scenes)}개")
+    print(f"  실패: {failed_count}개")
+
+    # Merge with existing data
+    existing_scenes, _ = load_existing_data()
+    all_scenes = existing_scenes + new_scenes
+    print(f"  합계: 기존 {len(existing_scenes)} + 신규 {len(new_scenes)} = {len(all_scenes)}개")
+
+    _save_and_split(all_scenes, config)
+    print("\n데이터 처리 완료!")
+
+
+# ---------------------------------------------------------------------------
+# Real-time generation (기존 방식)
+# ---------------------------------------------------------------------------
+
+def run_realtime(config: dict):
+    """실시간 API 호출로 데이터를 생성합니다."""
+    gen_config = config["data_generation"]
     model = os.getenv("OPENAI_MODEL", "gpt-4o")
-    client = OpenAI(api_key=api_key)
+    client = _get_client()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     total_target = gen_config["total_samples"]
     batch_size = gen_config["api_batch_size"]
-    genres = gen_config["genres"]
 
-    # Load existing data for incremental generation
     existing_scenes, genre_counts = load_existing_data()
     total_existing = len(existing_scenes)
 
     if total_existing >= total_target:
         print(f"이미 {total_existing}개 장면이 존재합니다 (목표: {total_target}). 추가 생성이 필요하지 않습니다.")
         print("데이터 분할만 다시 수행합니다...")
-        splits = split_dataset(existing_scenes, config)
-        for split_name, split_data in splits.items():
-            split_path = OUTPUT_DIR / f"{split_name}.json"
-            with open(split_path, "w", encoding="utf-8") as f:
-                json.dump(split_data, f, ensure_ascii=False, indent=2)
-            print(f"  {split_name}: {len(split_data)} samples => {split_path}")
-        generate_triplets(splits["train"], OUTPUT_DIR / "train_triplets.json")
-        generate_triplets(splits["val"], OUTPUT_DIR / "val_triplets.json")
+        _save_and_split(existing_scenes, config)
         print("\n데이터 분할 완료!")
         return
 
-    remaining = total_target - total_existing
-    samples_per_genre = remaining // len(genres)
-    batches_per_genre = max(1, samples_per_genre // batch_size)
+    genre_needs = _calc_genre_needs(config)
+    remaining = sum(genre_needs.values())
+    print(f"\n목표: {total_target}개 장면, 기존: {total_existing}개, 추가 생성: {remaining}개\n")
 
-    print(f"\n목표: {total_target}개 장면")
-    print(f"기존: {total_existing}개 장면")
-    print(f"추가 생성 필요: {remaining}개 장면")
-    print(f"  ~{samples_per_genre} samples/genre, {batches_per_genre} batches/genre (batch_size={batch_size})")
-    print()
+    all_scenes = list(existing_scenes)
 
-    all_scenes = list(existing_scenes)  # Start from existing data
-
-    for genre in genres:
+    for genre, needed in genre_needs.items():
         template = GENRE_TEMPLATES[genre]
-        existing_for_genre = genre_counts.get(genre, 0)
-        target_for_genre = total_target // len(genres)
-        needed = target_for_genre - existing_for_genre
-
-        if needed <= 0:
-            print(f"[{genre}] 이미 {existing_for_genre}개 존재 (목표: {target_for_genre}). 건너뜀.")
-            continue
-
         actual_batches = max(1, needed // batch_size)
-        print(f"[{genre}] {needed}개 추가 생성 (기존: {existing_for_genre}, 목표: {target_for_genre})...")
+        print(f"[{genre}] {needed}개 추가 생성...")
 
         genre_new_scenes = []
         for batch_idx in tqdm(range(actual_batches), desc=f"  {genre}"):
@@ -451,47 +704,19 @@ def main():
                 retry_delay=gen_config["api_retry_delay"],
             )
 
-            valid_scenes = []
             for scene in scenes:
                 if validate_scene(scene):
                     scene["genre"] = genre
-                    valid_scenes.append(scene)
+                    genre_new_scenes.append(scene)
 
-            genre_new_scenes.extend(valid_scenes)
-
-            # Rate limiting
             if batch_idx < actual_batches - 1:
                 time.sleep(1)
 
         print(f"  => {len(genre_new_scenes)} valid scenes generated (new)")
         all_scenes.extend(genre_new_scenes)
 
-        # Save/update per-genre file (existing + new)
-        genre_existing = [s for s in existing_scenes if s.get("genre") == genre]
-        genre_all = genre_existing + genre_new_scenes
-        genre_path = OUTPUT_DIR / f"raw_{genre}.json"
-        with open(genre_path, "w", encoding="utf-8") as f:
-            json.dump(genre_all, f, ensure_ascii=False, indent=2)
-
     print(f"\n총 장면 수: {len(all_scenes)}")
-
-    # Save complete raw dataset
-    raw_path = OUTPUT_DIR / "raw_all.json"
-    with open(raw_path, "w", encoding="utf-8") as f:
-        json.dump(all_scenes, f, ensure_ascii=False, indent=2)
-
-    # Split into train/val/test
-    splits = split_dataset(all_scenes, config)
-    for split_name, split_data in splits.items():
-        split_path = OUTPUT_DIR / f"{split_name}.json"
-        with open(split_path, "w", encoding="utf-8") as f:
-            json.dump(split_data, f, ensure_ascii=False, indent=2)
-        print(f"  {split_name}: {len(split_data)} samples => {split_path}")
-
-    # Generate training triplets file
-    generate_triplets(splits["train"], OUTPUT_DIR / "train_triplets.json")
-    generate_triplets(splits["val"], OUTPUT_DIR / "val_triplets.json")
-
+    _save_and_split(all_scenes, config)
     print("\nData generation complete!")
 
 
@@ -590,6 +815,46 @@ def metadata_to_passage(metadata: dict) -> str:
         parts.append("키워드: " + ", ".join(keywords))
 
     return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="BGE-M3 학습 데이터 생성")
+    parser.add_argument(
+        "--mode", type=str, default="realtime",
+        choices=["realtime", "batch", "batch-status", "batch-download"],
+        help="실행 모드: realtime(실시간), batch(Batch API 제출), batch-status(상태 확인), batch-download(결과 다운로드)",
+    )
+    parser.add_argument("--batch-id", type=str, default=None, help="Batch ID (batch-status, batch-download에서 필요)")
+    args = parser.parse_args()
+
+    config = load_config()
+
+    if args.mode == "realtime":
+        run_realtime(config)
+
+    elif args.mode == "batch":
+        client = _get_client()
+        jsonl_path = create_batch_requests(config)
+        if jsonl_path:
+            submit_batch(client, jsonl_path)
+
+    elif args.mode == "batch-status":
+        if not args.batch_id:
+            print("Error: --batch-id 필요. 예: --batch-id batch_xxxxx")
+            return
+        client = _get_client()
+        check_batch_status(client, args.batch_id)
+
+    elif args.mode == "batch-download":
+        if not args.batch_id:
+            print("Error: --batch-id 필요. 예: --batch-id batch_xxxxx")
+            return
+        client = _get_client()
+        download_batch_results(client, args.batch_id, config)
 
 
 if __name__ == "__main__":
