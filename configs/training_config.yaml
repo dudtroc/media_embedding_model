@@ -3,11 +3,12 @@
 # Data Generation Settings
 data_generation:
   # Total number of training samples to generate
-  # Hard Negative 개선을 위해 최소 20,000개 이상의 학습 데이터 필요
-  # - 15,000개: 학습용 (train)
-  # - 3,000개: 검증용 (validation)
-  # - 2,000개: 평가용 (test)
-  total_samples: 20000
+  # BGE-M3 (568M params) fine-tuning을 위해 최소 100,000개 권장
+  # - 75,000개: 학습용 (train)
+  # - 15,000개: 검증용 (validation)
+  # - 10,000개: 평가용 (test)
+  # 증분 생성 지원: 기존 데이터가 있으면 부족한 만큼만 추가 생성
+  total_samples: 100000
   train_ratio: 0.75
   val_ratio: 0.15
   test_ratio: 0.10
@@ -15,11 +16,14 @@ data_generation:
   # Number of queries per scene metadata
   queries_per_scene:
     normal: 3          # 정답 질의 (Positive)
-    hard_negative: 3   # 유사하지만 다른 장면을 가리키는 질의 (Hard Negative)
+    hard_negative: 5   # Entity-Attribute Swap, Action Misattribution 등 Hard Negative
     negative: 2        # 명확히 다른 질의 (Easy Negative)
 
-  # Batch size for GPT API calls
-  api_batch_size: 5
+  # Confusable scenes per main scene (혼동 유발 변형 장면)
+  confusable_scenes_per_scene: 2
+
+  # Batch size for GPT API calls (reduced for richer content generation)
+  api_batch_size: 3
   api_max_retries: 3
   api_retry_delay: 2
 

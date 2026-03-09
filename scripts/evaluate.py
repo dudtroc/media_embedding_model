@@ -42,20 +42,41 @@ def encode_texts(model, tokenizer, texts: list[str], device, max_length: int = 5
 
 
 def metadata_to_passage(metadata: dict) -> str:
-    """메타데이터를 passage 텍스트로 변환합니다."""
-    parts = [
-        f"장소: {metadata.get('Place', '')}",
-        f"시간: {metadata.get('Approximate Time', '')}",
-        f"분위기: {metadata.get('Atmosphere', '')}",
-        f"키워드: {', '.join(metadata.get('Keywords', []))}",
-    ]
-    for char in metadata.get("Main Characters", []):
-        parts.append(f"등장인물: {char.get('name', '')} ({char.get('type', '')}) - {char.get('description', '')}")
-    parts.append(f"요약: {metadata.get('caption', '')}")
+    """메타데이터를 자연어 passage로 변환합니다."""
+    parts = []
+
+    place = metadata.get("Place", "")
+    time_info = metadata.get("Approximate Time", "")
+    atmosphere = metadata.get("Atmosphere", "")
+    if place or time_info or atmosphere:
+        if all([place, time_info, atmosphere]):
+            parts.append(f"{place}에서 {time_info}에 벌어지는 {atmosphere} 장면이다.")
+        else:
+            parts.append(f"장소: {place}. 시간: {time_info}. 분위기: {atmosphere}.")
+
+    caption = metadata.get("caption", "")
+    if caption:
+        parts.append(caption)
+
+    characters = metadata.get("Main Characters", [])
+    char_descs = []
+    for char in characters:
+        if isinstance(char, dict):
+            char_descs.append(f"{char.get('name', '')}({char.get('type', '')}): {char.get('description', '')}")
+        elif isinstance(char, str) and char.strip():
+            char_descs.append(char)
+    if char_descs:
+        parts.append("등장인물: " + ". ".join(char_descs) + ".")
+
     actions = metadata.get("Action", [])
     if actions:
-        parts.append(f"행동: {' '.join(actions)}")
-    return " | ".join(parts)
+        parts.append(" ".join(actions))
+
+    keywords = metadata.get("Keywords", [])
+    if keywords:
+        parts.append("키워드: " + ", ".join(keywords))
+
+    return " ".join(parts)
 
 
 def evaluate_model(model, tokenizer, test_data: list, device) -> dict:
