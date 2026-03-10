@@ -8,9 +8,9 @@ data_generation:
   # - 15,000개: 검증용 (validation)
   # - 10,000개: 평가용 (test)
   # 증분 생성 지원: 기존 데이터가 있으면 부족한 만큼만 추가 생성
-  total_samples: 100000
-  train_ratio: 0.75
-  val_ratio: 0.15
+  total_samples: 90000
+  train_ratio: 0.80
+  val_ratio: 0.10
   test_ratio: 0.10
 
   # Number of queries per scene metadata
@@ -22,8 +22,9 @@ data_generation:
   # Confusable scenes per main scene (혼동 유발 변형 장면)
   confusable_scenes_per_scene: 2
 
-  # Batch size for GPT API calls (reduced for richer content generation)
-  api_batch_size: 3
+  # Batch size for GPT API calls
+  # - 요청 1회에 장면 1개만 생성하도록 스크립트가 동작하므로 1로 유지 권장
+  api_batch_size: 1
   api_max_retries: 3
   api_retry_delay: 2
 
