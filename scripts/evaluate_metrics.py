@@ -11,7 +11,9 @@ Test set을 이용하여 다음 4가지 지표를 측정합니다:
     python scripts/evaluate_metrics.py
     python scripts/evaluate_metrics.py --model_path ./models/bge-m3-finetuned/best
     python scripts/evaluate_metrics.py --threshold 0.8
+    python scripts/evaluate_metrics.py --sweep  # 0.5~1.0 구간 threshold 일괄 테스트
     python scripts/evaluate_metrics.py --compare  # 원본 vs fine-tuned 비교
+    python scripts/evaluate_metrics.py --compare --sweep  # 비교 + sweep
 """
 
 import argparse
@@ -89,26 +91,15 @@ def metadata_to_passage(metadata: dict) -> str:
     return " ".join(parts)
 
 
-def compute_metrics(
-    model, tokenizer, test_data: list, device, threshold: float = 0.85,
+def compute_similarities(
+    model, tokenizer, test_data: list, device,
 ) -> dict:
     """
-    4가지 정량적 평가 지표를 계산합니다.
-
-    Args:
-        model: 임베딩 모델
-        tokenizer: 토크나이저
-        test_data: 테스트 데이터 (장면 리스트)
-        device: 디바이스
-        threshold: 유사도 임계값
-
-    Returns:
-        dict with metric results and per-scene details
+    모델로 임베딩을 계산하고, 쿼리-passage 간 유사도를 반환합니다.
+    임베딩 계산은 비용이 크므로 한 번만 수행하고,
+    threshold별 지표 계산은 compute_metrics_from_sims에서 수행합니다.
     """
-    # --- 데이터 준비 ---
-    # scene_idx → passage
     passages = []
-    # (query_text, scene_idx) 리스트
     normal_queries = []
     hard_negative_queries = []
     negative_queries = []
@@ -130,78 +121,80 @@ def compute_metrics(
     print(f"  Normal queries: {len(normal_queries)}")
     print(f"  Hard negative queries: {len(hard_negative_queries)}")
     print(f"  Negative queries: {len(negative_queries)}")
-    print(f"  Threshold: {threshold}")
 
     # --- 임베딩 계산 ---
     passage_embeds = encode_texts(model, tokenizer, passages, device)
 
-    # Normal 쿼리 임베딩 및 유사도
-    normal_texts = [q[0] for q in normal_queries]
     normal_labels = [q[1] for q in normal_queries]
-    normal_embeds = encode_texts(model, tokenizer, normal_texts, device)
-    # 각 normal 쿼리와 대응 passage 간의 유사도
     normal_sims = []
-    for i, label in enumerate(normal_labels):
-        sim = torch.dot(normal_embeds[i], passage_embeds[label]).item()
-        normal_sims.append(sim)
+    if normal_queries:
+        normal_texts = [q[0] for q in normal_queries]
+        normal_embeds = encode_texts(model, tokenizer, normal_texts, device)
+        for i, label in enumerate(normal_labels):
+            sim = torch.dot(normal_embeds[i], passage_embeds[label]).item()
+            normal_sims.append(sim)
 
-    # Hard negative 쿼리 임베딩 및 유사도
+    hn_labels = [q[1] for q in hard_negative_queries]
     hn_sims = []
     if hard_negative_queries:
         hn_texts = [q[0] for q in hard_negative_queries]
-        hn_labels = [q[1] for q in hard_negative_queries]
         hn_embeds = encode_texts(model, tokenizer, hn_texts, device)
         for i, label in enumerate(hn_labels):
             sim = torch.dot(hn_embeds[i], passage_embeds[label]).item()
             hn_sims.append(sim)
 
-    # Negative 쿼리 임베딩 및 유사도
+    neg_labels = [q[1] for q in negative_queries]
     neg_sims = []
     if negative_queries:
         neg_texts = [q[0] for q in negative_queries]
-        neg_labels = [q[1] for q in negative_queries]
         neg_embeds = encode_texts(model, tokenizer, neg_texts, device)
         for i, label in enumerate(neg_labels):
             sim = torch.dot(neg_embeds[i], passage_embeds[label]).item()
             neg_sims.append(sim)
 
-    # =========================================================================
-    # 1. Positive Rate (정답 매칭률)
-    #    normal 쿼리 중 임계값 이상으로 매칭된 비율
-    # =========================================================================
+    return {
+        "normal_sims": normal_sims,
+        "normal_labels": normal_labels,
+        "hn_sims": hn_sims,
+        "hn_labels": hn_labels,
+        "neg_sims": neg_sims,
+        "neg_labels": neg_labels,
+    }
+
+
+def compute_metrics_from_sims(sims: dict, threshold: float) -> dict:
+    """
+    사전 계산된 유사도 결과로부터 threshold 기반 지표를 계산합니다.
+    """
+    normal_sims = sims["normal_sims"]
+    normal_labels = sims["normal_labels"]
+    hn_sims = sims["hn_sims"]
+    hn_labels = sims["hn_labels"]
+    neg_sims = sims["neg_sims"]
+
+    # 1. Positive Rate
     normal_above = sum(1 for s in normal_sims if s >= threshold)
     positive_rate = (normal_above / len(normal_sims) * 100) if normal_sims else 0.0
 
-    # =========================================================================
-    # 2. Negative Rate (오답 거부율)
-    #    hard_negative + negative 쿼리 중 임계값 미만으로 거부된 비율
-    # =========================================================================
+    # 2. Negative Rate
     all_neg_sims = hn_sims + neg_sims
     neg_below = sum(1 for s in all_neg_sims if s < threshold)
     negative_rate = (neg_below / len(all_neg_sims) * 100) if all_neg_sims else 0.0
 
-    # hard_negative만의 거부율
     hn_below = sum(1 for s in hn_sims if s < threshold)
     hn_negative_rate = (hn_below / len(hn_sims) * 100) if hn_sims else 0.0
 
-    # negative만의 거부율
     neg_only_below = sum(1 for s in neg_sims if s < threshold)
     neg_only_rate = (neg_only_below / len(neg_sims) * 100) if neg_sims else 0.0
 
-    # =========================================================================
-    # 3. 분리 성공률
-    #    normal 점수가 hard_negative 점수보다 높은 비교 쌍의 비율
-    #    같은 scene에 대한 normal-hard_negative 쌍을 비교
-    # =========================================================================
-    # scene별로 normal/hard_negative 점수 그룹화
+    # 3. 분리 성공률 & 4. 평균 마진 (threshold 무관, 상대 비교)
     scene_normal_sims: dict[int, list[float]] = {}
     for i, label in enumerate(normal_labels):
         scene_normal_sims.setdefault(label, []).append(normal_sims[i])
 
     scene_hn_sims: dict[int, list[float]] = {}
-    if hard_negative_queries:
-        for i, label in enumerate(hn_labels):
-            scene_hn_sims.setdefault(label, []).append(hn_sims[i])
+    for i, label in enumerate(hn_labels):
+        scene_hn_sims.setdefault(label, []).append(hn_sims[i])
 
     total_pairs = 0
     separation_success = 0
@@ -218,28 +211,20 @@ def compute_metrics(
                 margin_sum += (n_sim - h_sim)
 
     separation_rate = (separation_success / total_pairs * 100) if total_pairs > 0 else 0.0
-
-    # =========================================================================
-    # 4. 평균 마진
-    #    normal 점수와 hard_negative 점수의 평균 차이
-    # =========================================================================
     avg_margin = (margin_sum / total_pairs) if total_pairs > 0 else 0.0
 
-    # --- 요약 통계 ---
     avg_normal_sim = sum(normal_sims) / len(normal_sims) if normal_sims else 0.0
     avg_hn_sim = sum(hn_sims) / len(hn_sims) if hn_sims else 0.0
     avg_neg_sim = sum(neg_sims) / len(neg_sims) if neg_sims else 0.0
 
     return {
         "threshold": threshold,
-        # 핵심 지표
         "positive_rate (%)": round(positive_rate, 2),
         "negative_rate (%)": round(negative_rate, 2),
         "hard_negative_reject_rate (%)": round(hn_negative_rate, 2),
         "easy_negative_reject_rate (%)": round(neg_only_rate, 2),
         "separation_success_rate (%)": round(separation_rate, 2),
         "avg_margin": round(avg_margin, 4),
-        # 보조 통계
         "avg_normal_similarity": round(avg_normal_sim, 4),
         "avg_hard_negative_similarity": round(avg_hn_sim, 4),
         "avg_negative_similarity": round(avg_neg_sim, 4),
@@ -248,6 +233,33 @@ def compute_metrics(
         "total_negative_queries": len(neg_sims),
         "total_comparison_pairs": total_pairs,
     }
+
+
+def compute_metrics(
+    model, tokenizer, test_data: list, device, threshold: float = 0.85,
+) -> dict:
+    """단일 threshold로 평가합니다."""
+    sims = compute_similarities(model, tokenizer, test_data, device)
+    return compute_metrics_from_sims(sims, threshold)
+
+
+def compute_sweep(
+    model, tokenizer, test_data: list, device,
+    thresholds: list[float] | None = None,
+) -> list[dict]:
+    """
+    여러 threshold에 대해 일괄 평가합니다.
+    임베딩은 한 번만 계산하고 threshold만 변경하여 지표를 산출합니다.
+    """
+    if thresholds is None:
+        thresholds = [round(0.5 + 0.1 * i, 1) for i in range(6)]  # 0.5 ~ 1.0
+
+    sims = compute_similarities(model, tokenizer, test_data, device)
+    results = []
+    for t in thresholds:
+        metrics = compute_metrics_from_sims(sims, t)
+        results.append(metrics)
+    return results
 
 
 def print_metrics(metrics: dict, title: str = "Evaluation Results"):
@@ -277,6 +289,121 @@ def print_metrics(metrics: dict, title: str = "Evaluation Results"):
     print(f"    Negative 쿼리:      {metrics['total_negative_queries']:>6d}개")
     print(f"    비교 쌍:            {metrics['total_comparison_pairs']:>6d}개")
     print("=" * 70)
+
+
+def print_sweep_table(sweep_results: list[dict], title: str = "Threshold Sweep"):
+    """여러 threshold에 대한 결과를 한눈에 볼 수 있는 테이블로 출력합니다."""
+    print()
+    print("=" * 100)
+    print(f"  {title}")
+    print("=" * 100)
+    print(
+        f"  {'Threshold':>9}"
+        f"  {'Positive':>10}"
+        f"  {'Negative':>10}"
+        f"  {'HN Reject':>10}"
+        f"  {'Neg Reject':>10}"
+        f"  {'Separation':>10}"
+        f"  {'Avg Margin':>10}"
+    )
+    print(
+        f"  {'':>9}"
+        f"  {'Rate(%)':>10}"
+        f"  {'Rate(%)':>10}"
+        f"  {'Rate(%)':>10}"
+        f"  {'Rate(%)':>10}"
+        f"  {'Rate(%)':>10}"
+        f"  {'':>10}"
+    )
+    print("  " + "-" * 96)
+
+    for m in sweep_results:
+        print(
+            f"  {m['threshold']:>9.1f}"
+            f"  {m['positive_rate (%)']:>10.2f}"
+            f"  {m['negative_rate (%)']:>10.2f}"
+            f"  {m['hard_negative_reject_rate (%)']:>10.2f}"
+            f"  {m['easy_negative_reject_rate (%)']:>10.2f}"
+            f"  {m['separation_success_rate (%)']:>10.2f}"
+            f"  {m['avg_margin']:>10.4f}"
+        )
+
+    print("=" * 100)
+    print()
+    print("  [유사도 통계] (threshold 무관)")
+    m0 = sweep_results[0]
+    print(f"    Normal 평균 유사도:        {m0['avg_normal_similarity']:>8.4f}")
+    print(f"    Hard Negative 평균 유사도: {m0['avg_hard_negative_similarity']:>8.4f}")
+    print(f"    Negative 평균 유사도:      {m0['avg_negative_similarity']:>8.4f}")
+    print(f"    분리 성공률:               {m0['separation_success_rate (%)']:>8.2f}%")
+    print(f"    평균 마진:                 {m0['avg_margin']:>8.4f}")
+    print()
+    print(f"  [데이터 수]")
+    print(f"    Normal 쿼리:        {m0['total_normal_queries']:>6d}개")
+    print(f"    Hard Negative 쿼리: {m0['total_hard_negative_queries']:>6d}개")
+    print(f"    Negative 쿼리:      {m0['total_negative_queries']:>6d}개")
+    print(f"    비교 쌍:            {m0['total_comparison_pairs']:>6d}개")
+    print("=" * 100)
+
+
+def print_sweep_comparison(
+    orig_sweep: list[dict], ft_sweep: list[dict],
+):
+    """두 모델의 sweep 결과를 나란히 비교하는 테이블을 출력합니다."""
+    print()
+    print("=" * 115)
+    print("  Threshold Sweep Comparison: Original vs Fine-tuned")
+    print("=" * 115)
+
+    # Positive Rate 비교
+    print()
+    print("  [Positive Rate (%)]")
+    print(f"  {'Threshold':>9}  {'Original':>10}  {'Fine-tuned':>10}  {'Delta':>10}")
+    print("  " + "-" * 45)
+    for o, f in zip(orig_sweep, ft_sweep):
+        delta = f["positive_rate (%)"] - o["positive_rate (%)"]
+        sign = "+" if delta > 0 else ""
+        print(f"  {o['threshold']:>9.1f}  {o['positive_rate (%)']:>10.2f}  {f['positive_rate (%)']:>10.2f}  {sign}{delta:>9.2f}")
+
+    # Negative Rate 비교
+    print()
+    print("  [Negative Rate (%)]")
+    print(f"  {'Threshold':>9}  {'Original':>10}  {'Fine-tuned':>10}  {'Delta':>10}")
+    print("  " + "-" * 45)
+    for o, f in zip(orig_sweep, ft_sweep):
+        delta = f["negative_rate (%)"] - o["negative_rate (%)"]
+        sign = "+" if delta > 0 else ""
+        print(f"  {o['threshold']:>9.1f}  {o['negative_rate (%)']:>10.2f}  {f['negative_rate (%)']:>10.2f}  {sign}{delta:>9.2f}")
+
+    # Hard Negative Reject Rate 비교
+    print()
+    print("  [Hard Negative Reject Rate (%)]")
+    print(f"  {'Threshold':>9}  {'Original':>10}  {'Fine-tuned':>10}  {'Delta':>10}")
+    print("  " + "-" * 45)
+    for o, f in zip(orig_sweep, ft_sweep):
+        delta = f["hard_negative_reject_rate (%)"] - o["hard_negative_reject_rate (%)"]
+        sign = "+" if delta > 0 else ""
+        print(f"  {o['threshold']:>9.1f}  {o['hard_negative_reject_rate (%)']:>10.2f}  {f['hard_negative_reject_rate (%)']:>10.2f}  {sign}{delta:>9.2f}")
+
+    # 분리 성공률 & 평균 마진 (threshold 무관)
+    print()
+    print("  [Threshold 무관 지표]")
+    print(f"  {'Metric':<35}  {'Original':>10}  {'Fine-tuned':>10}  {'Delta':>10}")
+    print("  " + "-" * 70)
+    for key, name in [
+        ("separation_success_rate (%)", "분리 성공률 (%)"),
+        ("avg_margin", "평균 마진"),
+        ("avg_normal_similarity", "Normal 평균 유사도"),
+        ("avg_hard_negative_similarity", "Hard Neg 평균 유사도"),
+        ("avg_negative_similarity", "Negative 평균 유사도"),
+    ]:
+        o_val = orig_sweep[0][key]
+        f_val = ft_sweep[0][key]
+        delta = f_val - o_val
+        sign = "+" if delta > 0 else ""
+        print(f"  {name:<35}  {o_val:>10.4f}  {f_val:>10.4f}  {sign}{delta:>9.4f}")
+
+    print("=" * 115)
 
 
 def print_comparison(orig_metrics: dict, ft_metrics: dict):
@@ -325,6 +452,10 @@ def main():
         help="유사도 임계값 (default: 0.85)",
     )
     parser.add_argument(
+        "--sweep", action="store_true",
+        help="threshold 0.5~1.0 구간을 0.1 간격으로 일괄 테스트",
+    )
+    parser.add_argument(
         "--compare", action="store_true",
         help="원본 vs fine-tuned 모델 비교",
     )
@@ -343,6 +474,8 @@ def main():
         test_data = json.load(f)
     print(f"Test data: {len(test_data)} scenes from {test_path}")
 
+    sweep_thresholds = [round(0.5 + 0.1 * i, 1) for i in range(6)]  # 0.5 ~ 1.0
+
     if args.compare:
         # --- 원본 모델 ---
         print("\n" + "=" * 70)
@@ -350,10 +483,18 @@ def main():
         print("=" * 70)
         orig_tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-m3")
         orig_model = AutoModel.from_pretrained("BAAI/bge-m3", use_safetensors=True).to(device)
-        orig_metrics = compute_metrics(
-            orig_model, orig_tokenizer, test_data, device, args.threshold,
-        )
-        print_metrics(orig_metrics, "Original BGE-M3")
+
+        if args.sweep:
+            orig_sweep = compute_sweep(
+                orig_model, orig_tokenizer, test_data, device, sweep_thresholds,
+            )
+            print_sweep_table(orig_sweep, "Original BGE-M3 - Threshold Sweep")
+        else:
+            orig_metrics = compute_metrics(
+                orig_model, orig_tokenizer, test_data, device, args.threshold,
+            )
+            print_metrics(orig_metrics, "Original BGE-M3")
+
         del orig_model
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -367,27 +508,42 @@ def main():
         print("=" * 70)
         ft_tokenizer = AutoTokenizer.from_pretrained(ft_path)
         ft_model = AutoModel.from_pretrained(ft_path, use_safetensors=True).to(device)
-        ft_metrics = compute_metrics(
-            ft_model, ft_tokenizer, test_data, device, args.threshold,
-        )
-        print_metrics(ft_metrics, f"Fine-tuned BGE-M3 ({ft_path})")
 
-        # --- 비교 ---
-        print_comparison(orig_metrics, ft_metrics)
+        if args.sweep:
+            ft_sweep = compute_sweep(
+                ft_model, ft_tokenizer, test_data, device, sweep_thresholds,
+            )
+            print_sweep_table(ft_sweep, f"Fine-tuned BGE-M3 - Threshold Sweep")
+            print_sweep_comparison(orig_sweep, ft_sweep)
 
-        # Save comparison
-        output_path = args.output or str(
-            PROJECT_DIR / "models" / "evaluation_metrics_comparison.json"
-        )
+            output_path = args.output or str(
+                PROJECT_DIR / "models" / "evaluation_sweep_comparison.json"
+            )
+            save_data = {
+                "thresholds": sweep_thresholds,
+                "original": orig_sweep,
+                "finetuned": ft_sweep,
+            }
+        else:
+            ft_metrics = compute_metrics(
+                ft_model, ft_tokenizer, test_data, device, args.threshold,
+            )
+            print_metrics(ft_metrics, f"Fine-tuned BGE-M3 ({ft_path})")
+            print_comparison(orig_metrics, ft_metrics)
+
+            output_path = args.output or str(
+                PROJECT_DIR / "models" / "evaluation_metrics_comparison.json"
+            )
+            save_data = {
+                "threshold": args.threshold,
+                "original": orig_metrics,
+                "finetuned": ft_metrics,
+            }
+
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        comparison = {
-            "threshold": args.threshold,
-            "original": orig_metrics,
-            "finetuned": ft_metrics,
-        }
         with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(comparison, f, ensure_ascii=False, indent=2)
-        print(f"\nComparison saved to: {output_path}")
+            json.dump(save_data, f, ensure_ascii=False, indent=2)
+        print(f"\nResults saved to: {output_path}")
 
     else:
         # --- 단일 모델 평가 ---
@@ -398,16 +554,32 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         model = AutoModel.from_pretrained(model_path, use_safetensors=True).to(device)
 
-        metrics = compute_metrics(model, tokenizer, test_data, device, args.threshold)
-        print_metrics(metrics, f"Model: {model_path}")
+        if args.sweep:
+            sweep_results = compute_sweep(
+                model, tokenizer, test_data, device, sweep_thresholds,
+            )
+            print_sweep_table(sweep_results, f"Model: {model_path}")
 
-        # Save results
-        output_path = args.output or str(
-            PROJECT_DIR / "models" / "evaluation_metrics.json"
-        )
+            output_path = args.output or str(
+                PROJECT_DIR / "models" / "evaluation_sweep.json"
+            )
+            save_data = {
+                "model_path": model_path,
+                "thresholds": sweep_thresholds,
+                "results": sweep_results,
+            }
+        else:
+            metrics = compute_metrics(model, tokenizer, test_data, device, args.threshold)
+            print_metrics(metrics, f"Model: {model_path}")
+
+            output_path = args.output or str(
+                PROJECT_DIR / "models" / "evaluation_metrics.json"
+            )
+            save_data = metrics
+
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(metrics, f, ensure_ascii=False, indent=2)
+            json.dump(save_data, f, ensure_ascii=False, indent=2)
         print(f"\nResults saved to: {output_path}")
 
 
