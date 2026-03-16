@@ -55,6 +55,20 @@ python scripts/train.py --config configs/training_config.yaml
 accelerate launch scripts/train.py --config configs/training_config.yaml
 ```
 
+#### HuggingFace Hub 접근이 불가능한 서버에서(로컬 모델 사용)
+
+- 모델 폴더(예: `./models_cache/bge-m3/`) 안에 최소한 아래 파일들이 있어야 합니다.
+  - `config.json`
+  - `tokenizer.json` 또는 `tokenizer.model`/`vocab.*` 등 토크나이저 파일
+  - `model.safetensors` 또는 `pytorch_model.bin`
+
+```bash
+# 로컬 경로에서만 로드(네트워크 접근 차단)
+accelerate launch scripts/train.py --config configs/training_config.yaml \
+  --model_path ./models_cache/bge-m3 \
+  --local_files_only
+```
+
 특정 GPU 개수로 실행하고 싶다면:
 
 ```bash
@@ -73,6 +87,14 @@ python scripts/train_reranker.py --mode classification
 
 ```bash
 accelerate launch scripts/train_reranker.py --mode classification
+```
+
+#### HuggingFace Hub 접근이 불가능한 서버에서(로컬 모델 사용)
+
+```bash
+accelerate launch scripts/train_reranker.py --mode classification \
+  --model_name ./models_cache/bge-reranker-v2-m3 \
+  --local_files_only
 ```
 
 pairwise 모드 멀티 GPU 실행:

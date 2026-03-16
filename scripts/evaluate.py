@@ -178,6 +178,8 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate BGE-M3 model")
     parser.add_argument("--model_path", type=str, default=None,
                         help="Path to fine-tuned model (default: best checkpoint)")
+    parser.add_argument("--local_files_only", action="store_true",
+                        help="Do not try to reach HuggingFace Hub. Load only from local files.")
     parser.add_argument("--test_data", type=str, default=None,
                         help="Path to test data JSON")
     parser.add_argument("--compare", action="store_true",
@@ -198,8 +200,10 @@ def main():
         print("\n" + "=" * 60)
         print("Original BGE-M3")
         print("=" * 60)
-        orig_tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-m3")
-        orig_model = AutoModel.from_pretrained("BAAI/bge-m3", use_safetensors=True).to(device)
+        orig_tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-m3", local_files_only=args.local_files_only)
+        orig_model = AutoModel.from_pretrained(
+            "BAAI/bge-m3", use_safetensors=True, local_files_only=args.local_files_only
+        ).to(device)
         orig_metrics = evaluate_model(orig_model, orig_tokenizer, test_data, device)
         del orig_model
         torch.cuda.empty_cache() if device.type == "cuda" else None
@@ -208,8 +212,10 @@ def main():
         print("\n" + "=" * 60)
         print(f"Fine-tuned BGE-M3: {ft_path}")
         print("=" * 60)
-        ft_tokenizer = AutoTokenizer.from_pretrained(ft_path)
-        ft_model = AutoModel.from_pretrained(ft_path, use_safetensors=True).to(device)
+        ft_tokenizer = AutoTokenizer.from_pretrained(ft_path, local_files_only=args.local_files_only)
+        ft_model = AutoModel.from_pretrained(
+            ft_path, use_safetensors=True, local_files_only=args.local_files_only
+        ).to(device)
         ft_metrics = evaluate_model(ft_model, ft_tokenizer, test_data, device)
 
         # Print comparison
@@ -236,8 +242,10 @@ def main():
     else:
         model_path = args.model_path or str(PROJECT_DIR / "models" / "bge-m3-finetuned" / "best")
         print(f"\nEvaluating model: {model_path}")
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-        model = AutoModel.from_pretrained(model_path, use_safetensors=True).to(device)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=args.local_files_only)
+        model = AutoModel.from_pretrained(
+            model_path, use_safetensors=True, local_files_only=args.local_files_only
+        ).to(device)
 
         metrics = evaluate_model(model, tokenizer, test_data, device)
 

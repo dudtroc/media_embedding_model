@@ -165,7 +165,17 @@ def main():
     parser.add_argument("--train_data", type=str, default=None)
     parser.add_argument("--val_data", type=str, default=None)
 
-    parser.add_argument("--model_name", type=str, default="BAAI/bge-reranker-v2-m3")
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="BAAI/bge-reranker-v2-m3",
+        help="Local path or HF repo id for model/tokenizer",
+    )
+    parser.add_argument(
+        "--local_files_only",
+        action="store_true",
+        help="Do not try to reach HuggingFace Hub. Load only from local files.",
+    )
     parser.add_argument("--output_dir", type=str, default="./models/bge-reranker-v2-m3-finetuned")
 
     parser.add_argument("--epochs", type=int, default=None)
@@ -217,8 +227,12 @@ def main():
     if accelerator.is_local_main_process:
         print(f"Loading reranker model: {args.model_name}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = AutoModelForSequenceClassification.from_pretrained(args.model_name, num_labels=1)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, local_files_only=args.local_files_only)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        args.model_name,
+        num_labels=1,
+        local_files_only=args.local_files_only,
+    )
 
     train_path = Path(args.train_data) if args.train_data else (PROJECT_DIR / "data" / "train.json")
     val_path = Path(args.val_data) if args.val_data else (PROJECT_DIR / "data" / "val.json")

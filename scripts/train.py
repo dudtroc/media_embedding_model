@@ -254,6 +254,17 @@ def compute_ndcg(ranks: torch.Tensor, k: int = 10) -> float:
 def main():
     parser = argparse.ArgumentParser(description="BGE-M3 Fine-tuning for Hard Negative improvement")
     parser.add_argument("--config", type=str, default=None, help="Path to training config YAML")
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default=None,
+        help="Local path or HF repo id for base model/tokenizer. Overrides config.training.base_model",
+    )
+    parser.add_argument(
+        "--local_files_only",
+        action="store_true",
+        help="Do not try to reach HuggingFace Hub. Load only from local files.",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -266,12 +277,16 @@ def main():
     if accelerator.is_local_main_process:
         print(f"Using device: {accelerator.device}")
 
-    model_name = train_config["base_model"]
+    model_name = args.model_path or train_config["base_model"]
     if accelerator.is_local_main_process:
         print(f"Loading model: {model_name}")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name, use_safetensors=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=args.local_files_only)
+    model = AutoModel.from_pretrained(
+        model_name,
+        use_safetensors=True,
+        local_files_only=args.local_files_only,
+    )
 
     data_dir = PROJECT_DIR / "data"
     train_dataset = SceneTripletDataset(

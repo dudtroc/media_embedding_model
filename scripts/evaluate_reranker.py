@@ -103,6 +103,8 @@ def compute_ranks_for_queries(
 def main():
     parser = argparse.ArgumentParser(description="Evaluate bge-reranker-v2-m3 fine-tuned model")
     parser.add_argument("--model_path", type=str, required=True, help="Path to fine-tuned reranker model")
+    parser.add_argument("--local_files_only", action="store_true",
+                        help="Do not try to reach HuggingFace Hub. Load only from local files.")
     parser.add_argument("--test_data", type=str, default=None)
     parser.add_argument("--max_seq_length", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -133,8 +135,10 @@ def main():
     print(f"Normal queries: {len(normal_queries)}")
     print(f"Hard negative queries: {len(hard_neg_queries)}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    model = AutoModelForSequenceClassification.from_pretrained(args.model_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, local_files_only=args.local_files_only)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        args.model_path, local_files_only=args.local_files_only
+    )
     model.to(device)
     model.eval()
 
