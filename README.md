@@ -260,6 +260,22 @@ training:
     hard_negative_weight: 3.0    # Hard Negative 가중치
 ```
 
+## 멀티 GPU 학습 (Accelerate)
+
+이 프로젝트는 `accelerate`를 사용해 멀티 GPU(DDP) 학습을 지원합니다.
+
+```bash
+# (최초 1회) accelerate 설정 파일 생성
+accelerate config
+
+# Dense embedding 모델(BGE-M3) 멀티 GPU 학습
+accelerate launch scripts/train.py --config configs/training_config.yaml
+
+# Reranker(bge-reranker-v2-m3) 멀티 GPU 학습
+accelerate launch scripts/train_reranker.py --mode classification
+accelerate launch scripts/train_reranker.py --mode pairwise --prefer_confusable
+```
+
 ## Quick Start
 
 ```bash
