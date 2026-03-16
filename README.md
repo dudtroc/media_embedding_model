@@ -90,6 +90,8 @@ python scripts/generate_training_data.py --mode batch-download
 
 ### 2. 모델 학습
 
+#### 2-1. Dense Embedding 모델 학습 (기존: BGE-M3)
+
 BGE-M3 모델을 Hard Negative Contrastive Loss로 파인튜닝합니다.
 
 ```bash
@@ -126,6 +128,28 @@ models/bge-m3-finetuned/
 - **Triplet Margin Loss**: Positive-Negative 간 최소 마진(0.3) 보장
 - Hard Negative 가중치 3.0x, Easy Negative 가중치 1.0x
 
+### 2-2. Reranker 모델 학습 (신규: bge-reranker-v2-m3)
+
+Dense embedding(dual-encoder) 대신, (질의, 문서) pair를 함께 넣는 cross-encoder reranker를 학습할 수 있습니다.
+기본 모델은 `BAAI/bge-reranker-v2-m3` 입니다.
+
+```bash
+# (query, passage) binary classification 방식 (기본)
+python scripts/train_reranker.py --mode classification \
+  --negative_source hard_negative \
+  --negatives_per_positive 1
+
+# pairwise ranking 방식 (pos score > neg score)
+python scripts/train_reranker.py --mode pairwise \
+  --prefer_confusable \
+  --num_neg_passages 1
+```
+
+**출력 디렉토리(기본):**
+- `models/bge-reranker-v2-m3-finetuned/best`
+- `models/bge-reranker-v2-m3-finetuned/final`
+- `models/bge-reranker-v2-m3-finetuned/checkpoint-epoch-N`
+
 ### 3. 모델 평가
 
 두 가지 평가 스크립트를 제공합니다.
@@ -155,6 +179,19 @@ python scripts/evaluate.py --model_path ./models/bge-m3-finetuned/best
 #### 3-2. 임계값 기반 정량 평가 (evaluate_metrics.py)
 
 유사도 임계값(threshold)에 따른 매칭/거부 성능을 측정합니다.
+
+#### 3-3. Reranker 평가 (evaluate_reranker.py)
+
+Reranker는 (query, passage) pair를 점수화하여 후보 passage를 재정렬합니다.
+테스트 데이터에서 Recall@K, MRR 및 hard negative discrimination을 측정합니다.
+
+```bash
+# reranker 평가 (후보 전체를 점수화: 비용 큼)
+python scripts/evaluate_reranker.py --model_path ./models/bge-reranker-v2-m3-finetuned/best
+
+# 후보 passage 수 제한(정답 포함 N개만 평가) - 빠른 평가용
+python scripts/evaluate_reranker.py --model_path ./models/bge-reranker-v2-m3-finetuned/best --num_candidates 200
+```
 
 ```bash
 # 단일 threshold로 평가 (기본 0.85)
